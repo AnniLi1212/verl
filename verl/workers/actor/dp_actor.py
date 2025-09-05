@@ -375,6 +375,11 @@ class DataParallelPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
+        # Add separate advantages for SQL-GSPO if they exist
+        if "sql_advantages" in data.batch:
+            select_keys.append("sql_advantages")
+        if "plan_advantages" in data.batch:
+            select_keys.append("plan_advantages")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         if self.config.tis_imp_ratio_cap > 0:
@@ -444,16 +449,33 @@ class DataParallelPPOActor(BasePPOActor):
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
+                    # sql-gspo -> verl.trainer.ppo.core_algos.compute_policy_loss_sql_gspo
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_log_probs=rollout_log_probs,
-                    )
+                    
+                    # Special handling for sql-gspo to pass additional data
+                    if loss_mode == "sql-gspo":
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            tokenizer=getattr(self, 'tokenizer', None),
+                            responses=model_inputs.get("responses", None),
+                            sql_advantages=model_inputs.get("sql_advantages", None),
+                            plan_advantages=model_inputs.get("plan_advantages", None),
+                        )
+                    else:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_log_probs=rollout_log_probs,
+                        )
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

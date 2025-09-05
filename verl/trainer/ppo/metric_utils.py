@@ -15,6 +15,7 @@
 Metrics related to the PPO trainer.
 """
 
+import logging
 from collections import defaultdict
 from functools import partial
 from typing import Any, Callable
@@ -25,6 +26,8 @@ import torch
 from verl import DataProto
 from verl.utils.import_utils import deprecated
 
+# Get a logger for this module
+logger = logging.getLogger(__name__)
 
 @deprecated("verl.utils.metric.reduce_metrics")
 def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
@@ -94,6 +97,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             - critic/score/mean, max, min: Statistics about sequence scores
             - critic/rewards/mean, max, min: Statistics about sequence rewards
             - critic/advantages/mean, max, min: Statistics about advantages
+            - critic/advantages_sql/mean, max, min: Statistics about SQL-specific advantages (if available)
+            - critic/advantages_plan/mean, max, min: Statistics about plan-specific advantages (if available)
             - critic/returns/mean, max, min: Statistics about returns
             - critic/values/mean, max, min: Statistics about critic values (if use_critic=True)
             - critic/vf_explained_var: Explained variance of the value function (if use_critic=True)
@@ -135,6 +140,29 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
 
+    # Check for separate SQL and plan advantages
+    sql_advantages_metrics = {}
+    plan_advantages_metrics = {}
+    if "sql_advantages" in batch.batch and "plan_advantages" in batch.batch:
+        sql_advantages = batch.batch["sql_advantages"]  # (batch_size,)
+        plan_advantages = batch.batch["plan_advantages"]  # (batch_size,)
+        
+        print(f"DEBUG: Found separate advantages - SQL: {sql_advantages.shape}, Plan: {plan_advantages.shape}")
+        
+        # SQL advantages are sequence-level, so no masking needed
+        sql_advantages_metrics = {
+            "critic/advantages_sql/mean": torch.mean(sql_advantages).detach().item(),
+            "critic/advantages_sql/max": torch.max(sql_advantages).detach().item(),
+            "critic/advantages_sql/min": torch.min(sql_advantages).detach().item(),
+        }
+        
+        # Plan advantages are also sequence-level
+        plan_advantages_metrics = {
+            "critic/advantages_plan/mean": torch.mean(plan_advantages).detach().item(),
+            "critic/advantages_plan/max": torch.max(plan_advantages).detach().item(),
+            "critic/advantages_plan/min": torch.min(plan_advantages).detach().item(),
+        }
+
     if use_critic:
         values = batch.batch["values"]
         valid_values = torch.masked_select(values, response_mask)
@@ -169,6 +197,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
         "critic/advantages/max": torch.max(valid_adv).detach().item(),
         "critic/advantages/min": torch.min(valid_adv).detach().item(),
+        # separate SQL and plan advantages (if available)
+        **sql_advantages_metrics,
+        **plan_advantages_metrics,
         # returns
         "critic/returns/mean": torch.mean(valid_returns).detach().item(),
         "critic/returns/max": torch.max(valid_returns).detach().item(),
@@ -208,6 +239,42 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
 
+    # Add itemized rewards from custom reward function
+    # These are assumed to be present in batch.batch as 1D tensors (batch_size,)
+    # The keys in batch.batch are an assumption (e.g., 'reward_valid_sql').
+    # The component_name will be used in the metric key (e.g., 'itemized_rewards/valid_sql/mean').
+    itemized_reward_components_to_log = {
+        "execution": "reward_execution",                    # SQL executes successfully  
+        "match": "reward_match",                           # Results match ground truth
+        "format": "reward_format",                         # Plan format is valid
+        "table_linking": "reward_table_linking",           # Plan tables match GT tables
+        "column_linking": "reward_column_linking",         # Plan columns match GT columns  
+        "table_plan_following": "reward_table_plan_following",  # SQL follows plan tables
+        "column_plan_following": "reward_column_plan_following", # SQL follows plan columns
+        "sql_reward": "reward_sql",
+        "plan_reward": "reward_plan",
+        "total_score": "reward_total_score",               # Overall composite score
+    }
+
+    for component_name, batch_key in itemized_reward_components_to_log.items():
+        if batch_key in batch.batch:
+            component_tensor = batch.batch[batch_key]
+            # Ensure the component_tensor is a 1D tensor and has elements.
+            if isinstance(component_tensor, torch.Tensor) and component_tensor.ndim == 1 and component_tensor.numel() > 0:
+                component_tensor_float = component_tensor.float() # Ensure float for calculations
+                metrics[f"itemized_rewards/{component_name}/mean"] = torch.mean(component_tensor_float).detach().item()
+                metrics[f"itemized_rewards/{component_name}/max"] = torch.max(component_tensor_float).detach().item()
+                metrics[f"itemized_rewards/{component_name}/min"] = torch.min(component_tensor_float).detach().item()
+            elif isinstance(component_tensor, torch.Tensor) and component_tensor.numel() == 0:
+                logger.debug(f"Itemized reward component '{component_name}' (key: {batch_key}) is an empty tensor. Skipping metrics.")
+            elif not isinstance(component_tensor, torch.Tensor) or component_tensor.ndim != 1:
+                 logger.warning(
+                    f"Itemized reward component '{component_name}' (key: {batch_key}) is not a 1D tensor "
+                    f"(ndim: {component_tensor.ndim if isinstance(component_tensor, torch.Tensor) else 'N/A'}, "
+                    f"type: {type(component_tensor)}). Skipping metrics."
+                )
+        else:
+            logger.debug(f"Itemized reward component key '{batch_key}' for '{component_name}' not found in batch.batch. Skipping metrics.")
     # multi-turn conversation
     if "__num_turns__" in batch.non_tensor_batch:
         num_turns = batch.non_tensor_batch["__num_turns__"]

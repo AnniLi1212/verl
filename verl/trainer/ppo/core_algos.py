@@ -102,6 +102,7 @@ class AdvantageEstimator(str, Enum):
     OPO = "opo"
     GRPO_PASSK = "grpo_passk"
     GPG = "gpg"
+    SQL_PLAN_GRPO = "sql_plan_grpo"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -685,6 +686,177 @@ def compute_gpg_outcome_advantage(
     return scores, scores
 
 
+@register_adv_est("sql_plan_grpo")
+def compute_sql_plan_grpo_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    reward_extra_info: Optional[dict] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute separate SQL and plan GRPO-style advantages
+    
+    Args:
+        token_level_rewards: (bs, response_length) - used as fallback total reward
+        response_mask: (bs, response_length)
+        index: (bs,) - group indices for GRPO normalization  
+        epsilon: Small value for numerical stability
+        norm_adv_by_std_in_grpo: Whether to normalize by std (should be True)
+        config: Algorithm configuration
+        reward_extra_info: Dict containing 'sql_reward' and 'plan_reward' lists
+        
+    Returns:
+        advantages: (bs, response_length) - combined advantages for token assignment
+        returns: (bs, response_length) - same as advantages
+    """
+    batch_size = token_level_rewards.shape[0]
+    # print(f"DEBUG: Advantage estimator batch_size = {batch_size}")
+    # print(f"DEBUG: token_level_rewards.shape = {token_level_rewards.shape}")
+    # print(f"DEBUG: index.shape = {index.shape if hasattr(index, 'shape') else len(index)}")
+    # print(f"DEBUG: Unique UIDs in batch: {list(set(index))}, total unique: {len(set(index))}")
+    
+    # Extract separate SQL and plan rewards from reward_extra_info
+    if reward_extra_info is not None and 'sql_reward' in reward_extra_info and 'plan_reward' in reward_extra_info:
+        sql_reward_data = reward_extra_info['sql_reward']
+        plan_reward_data = reward_extra_info['plan_reward']
+        
+        # Handle both tensor and list inputs properly
+        if isinstance(sql_reward_data, torch.Tensor):
+            sql_rewards = sql_reward_data.clone().detach().to(dtype=torch.float32, device=token_level_rewards.device)
+        else:
+            sql_rewards = torch.tensor(sql_reward_data, dtype=torch.float32, device=token_level_rewards.device)
+            
+        if isinstance(plan_reward_data, torch.Tensor):
+            plan_rewards = plan_reward_data.clone().detach().to(dtype=torch.float32, device=token_level_rewards.device)
+        else:
+            plan_rewards = torch.tensor(plan_reward_data, dtype=torch.float32, device=token_level_rewards.device)
+            
+        print(f"DEBUG: reward_extra_info keys: {list(reward_extra_info.keys())}")
+        print(f"DEBUG: sql_reward_data type: {type(sql_reward_data)}, length/shape: {len(sql_reward_data) if hasattr(sql_reward_data, '__len__') else 'no length'}")
+        print(f"DEBUG: plan_reward_data type: {type(plan_reward_data)}, length/shape: {len(plan_reward_data) if hasattr(plan_reward_data, '__len__') else 'no length'}")
+        print(f"DEBUG: Using separate SQL ({sql_rewards.shape}) and plan ({plan_rewards.shape}) rewards")
+        print(f"DEBUG: SQL rewards range: {sql_rewards.min():.4f} to {sql_rewards.max():.4f}")
+        print(f"DEBUG: Plan rewards range: {plan_rewards.min():.4f} to {plan_rewards.max():.4f}")
+    else:
+        # Fallback: use total rewards for both components
+        print("WARNING: sql_reward/plan_reward not found in reward_extra_info, falling back to total rewards")
+        total_scores = token_level_rewards.sum(dim=-1)
+        sql_rewards = total_scores * 0.7
+        plan_rewards = total_scores * 0.3
+    
+    # Apply GRPO-style z-score normalization separately to SQL and plan rewards
+    # This gives us separate advantages that can be used independently by the policy loss
+    sql_advantages = torch.zeros_like(sql_rewards)
+    plan_advantages = torch.zeros_like(plan_rewards)
+    
+    sql_weight_sum = 0.78  # Default fallback
+    plan_weight_sum = 0.22  # Default fallback
+    
+    # Try to read weights from config
+    if config is not None:
+        try:
+            # Navigate to custom_reward_function.reward_kwargs.reward_weights if it exists
+            if hasattr(config, 'custom_reward_function'):
+                reward_config = config.custom_reward_function
+                if hasattr(reward_config, 'reward_kwargs') and hasattr(reward_config.reward_kwargs, 'reward_weights'):
+                    weights = reward_config.reward_kwargs.reward_weights
+                    
+                    # SQL component weights
+                    sql_weight_sum = (
+                        weights.get('execution', 0.2) +
+                        weights.get('match', 0.5) +
+                        weights.get('table_plan_following', 0.05) +
+                        weights.get('column_plan_following', 0.03)
+                    )
+                    
+                    # Plan component weights  
+                    plan_weight_sum = (
+                        weights.get('format', 0.1) +
+                        weights.get('table_linking', 0.07) +
+                        weights.get('column_linking', 0.05)
+                    )
+                    
+                    print(f"DEBUG: Read reward weights from config - SQL: {sql_weight_sum:.3f}, Plan: {plan_weight_sum:.3f}")
+                else:
+                    print("DEBUG: reward_weights not found in config, using defaults")
+            else:
+                print("DEBUG: custom_reward_function not found in config, using defaults")
+        except Exception as e:
+            print(f"DEBUG: Error reading reward weights from config: {e}, using defaults")
+    else:
+        print("DEBUG: No config provided, using default weight ratios")
+    
+    weight_ratio = sql_weight_sum / plan_weight_sum
+    print(f"DEBUG: Using weight ratio (SQL/Plan): {weight_ratio:.4f} (SQL: {sql_weight_sum:.3f}, Plan: {plan_weight_sum:.3f})")
+    
+    # SQL advantages normalization
+    id2sql_score = defaultdict(list)
+    id2sql_mean = {}
+    id2sql_std = {}
+    
+    with torch.no_grad():
+        for i in range(batch_size):
+            id2sql_score[index[i]].append(sql_rewards[i])
+        for idx in id2sql_score:
+            if len(id2sql_score[idx]) == 1:
+                id2sql_mean[idx] = torch.tensor(0.0, device=sql_rewards.device)
+                id2sql_std[idx] = torch.tensor(1.0, device=sql_rewards.device)
+            elif len(id2sql_score[idx]) > 1:
+                sql_scores_tensor = torch.stack(id2sql_score[idx])
+                id2sql_mean[idx] = torch.mean(sql_scores_tensor)
+                id2sql_std[idx] = torch.std(sql_scores_tensor)
+            else:
+                raise ValueError(f"No SQL scores found for group index: {idx}")
+        for i in range(batch_size):
+            if norm_adv_by_std_in_grpo:
+                sql_advantages[i] = (sql_rewards[i] - id2sql_mean[index[i]]) / (id2sql_std[index[i]] + epsilon)
+            else:
+                sql_advantages[i] = sql_rewards[i] - id2sql_mean[index[i]]
+    
+    # Plan advantages normalization  
+    id2plan_score = defaultdict(list)
+    id2plan_mean = {}
+    id2plan_std = {}
+    
+    with torch.no_grad():
+        for i in range(batch_size):
+            id2plan_score[index[i]].append(plan_rewards[i])
+        for idx in id2plan_score:
+            if len(id2plan_score[idx]) == 1:
+                id2plan_mean[idx] = torch.tensor(0.0, device=plan_rewards.device)
+                id2plan_std[idx] = torch.tensor(1.0, device=plan_rewards.device)
+            elif len(id2plan_score[idx]) > 1:
+                plan_scores_tensor = torch.stack(id2plan_score[idx])
+                id2plan_mean[idx] = torch.mean(plan_scores_tensor)
+                id2plan_std[idx] = torch.std(plan_scores_tensor)
+            else:
+                raise ValueError(f"No plan scores found for group index: {idx}")
+        for i in range(batch_size):
+            if norm_adv_by_std_in_grpo:
+                plan_advantages[i] = (plan_rewards[i] - id2plan_mean[index[i]]) / (id2plan_std[index[i]] + epsilon)
+                # Scale plan advantages to preserve relative importance vs SQL using weight ratio
+                plan_advantages[i] = plan_advantages[i] / weight_ratio
+            else:
+                plan_advantages[i] = (plan_rewards[i] - id2plan_mean[index[i]]) / weight_ratio
+    
+    # For the main advantages parameter, use the sum of normalized advantages
+    # This will be used by the policy loss as a fallback when auxiliary assignment isn't used
+    combined_advantages = sql_advantages + plan_advantages
+    
+    print(f"DEBUG: Combined advantages range: {combined_advantages.min():.4f} to {combined_advantages.max():.4f}")
+    print(f"DEBUG: SQL advantages range: {sql_advantages.min():.4f} to {sql_advantages.max():.4f}")
+    print(f"DEBUG: Plan advantages range: {plan_advantages.min():.4f} to {plan_advantages.max():.4f}")
+    
+    # The policy loss expects token-level advantages for the main advantages parameter
+    # but sequence-level sql_advantages and plan_advantages for auxiliary assignment
+    advantages = combined_advantages.unsqueeze(-1) * response_mask
+    
+    return advantages, advantages, sql_advantages, plan_advantages
+
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     """Compute token-level rewards with KL penalty.
 
@@ -967,6 +1139,239 @@ def compute_policy_loss_gspo(
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
+
+@register_policy_loss("sql-gspo")
+def compute_policy_loss_sql_gspo(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "seq-mean-token-mean",
+    config: Optional[DictConfig | ActorConfig] = None,
+    tokenizer=None,
+    responses=None,
+    sql_advantages: Optional[torch.Tensor] = None,
+    plan_advantages: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute the clipped policy objective for SQL-GSPO.
+    
+    Applies GSPO sequence-level optimization to SQL content only,
+    falls back to vanilla PPO for non-SQL content.
+
+    Args:
+        old_log_prob (torch.Tensor):
+            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+        log_prob (torch.Tensor):
+            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+        advantages (torch.Tensor):
+            Advantage estimates for each action, shape (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+        loss_agg_mode (str, optional):
+            Aggregation mode for `agg_loss`.
+        config: Actor configuration.
+        tokenizer: Tokenizer for SQL extraction (if available).
+        responses: Raw response token IDs for SQL extraction (if available).
+    """
+    
+    assert config is not None
+    assert isinstance(config, ActorConfig)
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
+    alpha_aux = config.get("alpha_aux", 0.8)  # Auxiliary advantage scaling factor
+
+    negative_approx_kl = log_prob - old_log_prob
+    batch_size, response_length = old_log_prob.shape
+    
+    # Use separate SQL and plan advantages if provided
+    if sql_advantages is not None and plan_advantages is not None:
+        print(f"DEBUG: Using separate SQL and plan advantages from advantage estimator")
+        # print(f"DEBUG: sql_advantages shape: {sql_advantages.shape}, range: {sql_advantages.min():.4f} to {sql_advantages.max():.4f}")
+        # print(f"DEBUG: plan_advantages shape: {plan_advantages.shape}, range: {plan_advantages.min():.4f} to {plan_advantages.max():.4f}")
+        # print(f"DEBUG: Policy loss batch_size = {batch_size}, advantages.shape = {advantages.shape}")
+    else:
+        print("DEBUG: No separate advantages found, using fallback")
+        sql_advantages = None
+        plan_advantages = None
+    
+    # Initialize with vanilla PPO ratios (fallback)
+    ratio = torch.exp(torch.clamp(negative_approx_kl, min=-20.0, max=20.0))
+    
+    # Try to apply SQL-GSPO if we can extract SQL positions
+    sql_mask = None
+    if tokenizer is not None and responses is not None:
+        try:
+            sql_mask = _compute_sql_mask_for_policy_loss(responses, tokenizer, response_mask)
+        except Exception as e:
+            print(f"WARNING: Failed to compute SQL mask for SQL-GSPO, falling back to vanilla PPO: {e}")
+    
+    if sql_mask is not None:
+        # Apply GSPO to SQL regions, vanilla PPO to non-SQL regions
+        print("DEBUG: Applying SQL-GSPO with SQL content detection")
+        
+        # Create a new ratio tensor to avoid in-place operations
+        new_ratio = ratio.clone()
+        
+        # For SQL regions: compute sequence-level importance ratio like GSPO
+        # For each sample, if it has SQL content, apply GSPO-style ratio to SQL tokens
+        for i in range(batch_size):
+            sql_tokens_mask = sql_mask[i] * response_mask[i]  # SQL tokens for this sample
+            
+            if sql_tokens_mask.sum() > 0:
+                # This sample has SQL content - apply GSPO to SQL tokens
+                sql_length = sql_tokens_mask.sum().clamp(min=1)
+                sql_negative_approx_kl_seq = torch.sum(negative_approx_kl[i] * sql_tokens_mask) / sql_length
+                
+                # Apply GSPO-style sequence-level ratio to SQL tokens
+                log_seq_importance_ratio = (
+                    log_prob[i] - log_prob[i].detach() + 
+                    sql_negative_approx_kl_seq.detach()
+                )
+                log_seq_importance_ratio = torch.clamp(log_seq_importance_ratio, max=10.0)
+                seq_importance_ratio = torch.exp(log_seq_importance_ratio)
+                
+                # Apply sequence-level ratio only to SQL tokens (avoid in-place operation)
+                new_ratio[i] = torch.where(
+                    sql_tokens_mask.bool(),
+                    seq_importance_ratio,
+                    new_ratio[i]  # Keep vanilla ratio for non-SQL tokens
+                )
+        
+        # Use the new ratio tensor
+        ratio = new_ratio
+    else:
+        print("DEBUG: SQL-GSPO falling back to whole GSPO (no SQL detection)")
+        # Add debugging to see what responses look like
+        if responses is not None and tokenizer is not None:
+            sample_responses = responses[:min(2, responses.shape[0])]  # Log first 2 responses
+            for i, response_ids in enumerate(sample_responses):
+                try:
+                    valid_mask = response_ids != tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') else response_ids != 0
+                    if valid_mask.sum() > 0:
+                        valid_response_ids = response_ids[valid_mask]
+                        response_text = tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+                        print(f"DEBUG: Sample response {i} (first 200 chars): {response_text[:200]}")
+                except Exception as e:
+                    print(f"DEBUG: Failed to decode response {i}: {e}")
+        else:
+            print(f"DEBUG: No responses or tokenizer available for debugging")
+            print(f"DEBUG: tokenizer is None: {tokenizer is None}")
+            print(f"DEBUG: responses is None: {responses is None}")
+            if responses is not None:
+                print(f"DEBUG: responses shape: {responses.shape if hasattr(responses, 'shape') else 'no shape'}")
+                print(f"DEBUG: responses type: {type(responses)}")
+    
+    # Compute auxiliary advantage assignments: A = A_sql ⊙ M_sql + α_aux * A_plan ⊙ M_plan
+    if sql_advantages is not None and plan_advantages is not None:
+        print("DEBUG: Using auxiliary advantage assignment")
+        
+        # Create advantage tensor with separate SQL and plan components
+        advantage_tensor = torch.zeros_like(advantages)
+        
+        for i in range(batch_size):
+            if sql_mask is not None:
+                sql_tokens_mask = sql_mask[i] * response_mask[i]
+                plan_tokens_mask = (1.0 - sql_mask[i]) * response_mask[i]
+            else:
+                # No SQL detection: treat everything as plan
+                sql_tokens_mask = torch.zeros_like(response_mask[i])
+                plan_tokens_mask = response_mask[i]
+            
+            # Assign advantages: A = A_sql ⊙ M_sql + α_aux * A_plan ⊙ M_plan
+            advantage_tensor[i] = (
+                sql_advantages[i] * sql_tokens_mask +
+                alpha_aux * plan_advantages[i] * plan_tokens_mask
+            )
+        
+        # Use auxiliary advantages instead of the original advantages
+        advantages = advantage_tensor
+
+    # Compute policy gradient loss with the computed ratios
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * torch.clamp(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+    
+    # Use sequence-level aggregation for consistency with GSPO
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean")
+    
+    # Compute metrics
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+    pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
+def _compute_sql_mask_for_policy_loss(responses: torch.Tensor, tokenizer, response_mask: torch.Tensor) -> torch.Tensor:
+    """Helper function to compute SQL mask for policy loss computation.
+    
+    Returns:
+        torch.Tensor: SQL mask of shape (batch_size, response_length) where 1=SQL, 0=non-SQL
+    """
+    import re
+    
+    batch_size, response_length = responses.shape
+    sql_mask = torch.zeros_like(responses, dtype=torch.float)
+    
+    for i in range(batch_size):
+        try:
+            response_ids = responses[i]
+            # print(f"🦋: Response_ids: {response_ids}")
+            
+            # Find non-zero tokens (ignore padding)
+            valid_mask = response_ids != tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') else response_ids != 0
+            if valid_mask.sum() == 0:
+                continue
+                
+            # Decode response text
+            valid_response_ids = response_ids[valid_mask]
+            response_text = tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            # print(f"🦋: Response_text: {response_text}")
+            
+            # Extract SQL content and positions
+            sql_pattern = r'```sql\s*(.*?)```'
+            sql_match = re.search(sql_pattern, response_text, re.DOTALL | re.IGNORECASE)
+            
+            if sql_match:
+                # Found SQL block - compute token positions
+                content_start = sql_match.start(1)
+                content_end = sql_match.end(1)
+                
+                # Map to token positions (approximate)
+                pre_sql_text = response_text[:content_start]
+                sql_content = response_text[content_start:content_end]
+                
+                pre_sql_tokens = tokenizer.encode(pre_sql_text, add_special_tokens=False) if pre_sql_text else []
+                sql_tokens = tokenizer.encode(sql_content, add_special_tokens=False) if sql_content else []
+                
+                valid_positions = torch.where(valid_mask)[0]
+                sql_start_pos = min(len(pre_sql_tokens), len(valid_positions) - 1)
+                sql_end_pos = min(sql_start_pos + len(sql_tokens), len(valid_positions))
+                
+                # Mark SQL tokens
+                for token_idx in range(sql_start_pos, sql_end_pos):
+                    if token_idx < len(valid_positions):
+                        original_pos = valid_positions[token_idx]
+                        if original_pos < response_length:
+                            sql_mask[i, original_pos] = 1.0
+            else:
+                # No SQL found - mark all tokens for fallback (GSPO behavior)
+                valid_positions = torch.where(valid_mask)[0]
+                for pos in valid_positions:
+                    if pos < response_length:
+                        sql_mask[i, pos] = 1.0  # Treat as "SQL" to get normal optimization
+                        
+        except Exception as e:
+            print(f"WARNING: Error in SQL mask computation for sample {i}: {e}")
+            # On error, mark all valid tokens (fallback to GSPO)
+            valid_mask = responses[i] != tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') else responses[i] != 0
+            valid_positions = torch.where(valid_mask)[0]
+            for pos in valid_positions:
+                if pos < response_length:
+                    sql_mask[i, pos] = 1.0
+    
+    return sql_mask
 
 @register_policy_loss("gpg")
 def compute_policy_loss_gpg(
