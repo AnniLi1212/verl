@@ -316,14 +316,30 @@ class MegatronPPOActor(BasePPOActor):
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
         policy_loss_fn = get_policy_loss_fn(loss_mode)
-        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-            old_log_prob=old_log_prob,
-            log_prob=log_prob,
-            advantages=advantages,
-            response_mask=response_mask,
-            loss_agg_mode=loss_agg_mode,
-            config=self.config,
-        )
+        
+        # Special handling for ts_gspo to pass additional data
+        if loss_mode == "ts_gspo":
+            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                old_log_prob=old_log_prob,
+                log_prob=log_prob,
+                advantages=advantages,
+                response_mask=response_mask,
+                loss_agg_mode=loss_agg_mode,
+                config=self.config,
+                tokenizer=getattr(self, 'tokenizer', None),
+                responses=data.get("responses", None),
+                sequence_advantages=data.get("sequence_advantages", None),
+                token_advantages=data.get("token_advantages", None),
+            )
+        else:
+            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                old_log_prob=old_log_prob,
+                log_prob=log_prob,
+                advantages=advantages,
+                response_mask=response_mask,
+                loss_agg_mode=loss_agg_mode,
+                config=self.config,
+            )
 
         metrics.update(
             {

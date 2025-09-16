@@ -15,6 +15,7 @@
 Metrics related to the PPO trainer.
 """
 
+import logging
 from collections import defaultdict
 from functools import partial
 from typing import Any, Callable
@@ -25,6 +26,8 @@ import torch
 from verl import DataProto
 from verl.utils.import_utils import deprecated
 
+# Get a logger for this module
+logger = logging.getLogger(__name__)
 
 @deprecated("verl.utils.metric.reduce_metrics")
 def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
@@ -94,6 +97,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             - critic/score/mean, max, min: Statistics about sequence scores
             - critic/rewards/mean, max, min: Statistics about sequence rewards
             - critic/advantages/mean, max, min: Statistics about advantages
+            - critic/advantages_sequence/mean, max, min: Statistics about sequence-specific advantages (if available)
+            - critic/advantages_token/mean, max, min: Statistics about token-specific advantages (if available)
             - critic/returns/mean, max, min: Statistics about returns
             - critic/values/mean, max, min: Statistics about critic values (if use_critic=True)
             - critic/vf_explained_var: Explained variance of the value function (if use_critic=True)
@@ -135,6 +140,29 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
 
+    # Check for separate sequence and token advantages
+    sequence_advantages_metrics = {}
+    token_advantages_metrics = {}
+    if "sequence_advantages" in batch.batch and "token_advantages" in batch.batch:
+        sequence_advantages = batch.batch["sequence_advantages"]  # (batch_size,)
+        token_advantages = batch.batch["token_advantages"]  # (batch_size,)
+        
+        print(f"DEBUG: Found separate advantages - sequence: {sequence_advantages.shape}, token: {token_advantages.shape}")
+        
+        # sequence advantages are sequence-level, so no masking needed
+        sequence_advantages_metrics = {
+            "critic/advantages_sequence/mean": torch.mean(sequence_advantages).detach().item(),
+            "critic/advantages_sequence/max": torch.max(sequence_advantages).detach().item(),
+            "critic/advantages_sequence/min": torch.min(sequence_advantages).detach().item(),
+        }
+        
+        # token advantages are also sequence-level
+        token_advantages_metrics = {
+            "critic/advantages_token/mean": torch.mean(token_advantages).detach().item(),
+            "critic/advantages_token/max": torch.max(token_advantages).detach().item(),
+            "critic/advantages_token/min": torch.min(token_advantages).detach().item(),
+        }
+
     if use_critic:
         values = batch.batch["values"]
         valid_values = torch.masked_select(values, response_mask)
@@ -169,6 +197,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
         "critic/advantages/max": torch.max(valid_adv).detach().item(),
         "critic/advantages/min": torch.min(valid_adv).detach().item(),
+        # separate sequence and token advantages (if available)
+        **sequence_advantages_metrics,
+        **token_advantages_metrics,
         # returns
         "critic/returns/mean": torch.mean(valid_returns).detach().item(),
         "critic/returns/max": torch.max(valid_returns).detach().item(),
@@ -208,6 +239,35 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
 
+    # Add itemized rewards from custom reward function
+    # These are assumed to be present in batch.batch as 1D tensors (batch_size,)
+    # The keys in batch.batch are an assumption (e.g., 'reward_valid_sql').
+    # The component_name will be used in the metric key (e.g., 'itemized_rewards/valid_sql/mean').
+    itemized_reward_components_to_log = {
+        "match": "reward_match",
+        "format": "reward_format",
+        "total_score": "reward_total_score",
+    }
+
+    for component_name, batch_key in itemized_reward_components_to_log.items():
+        if batch_key in batch.batch:
+            component_tensor = batch.batch[batch_key]
+            # Ensure the component_tensor is a 1D tensor and has elements.
+            if isinstance(component_tensor, torch.Tensor) and component_tensor.ndim == 1 and component_tensor.numel() > 0:
+                component_tensor_float = component_tensor.float() # Ensure float for calculations
+                metrics[f"itemized_rewards/{component_name}/mean"] = torch.mean(component_tensor_float).detach().item()
+                metrics[f"itemized_rewards/{component_name}/max"] = torch.max(component_tensor_float).detach().item()
+                metrics[f"itemized_rewards/{component_name}/min"] = torch.min(component_tensor_float).detach().item()
+            elif isinstance(component_tensor, torch.Tensor) and component_tensor.numel() == 0:
+                logger.debug(f"Itemized reward component '{component_name}' (key: {batch_key}) is an empty tensor. Skipping metrics.")
+            elif not isinstance(component_tensor, torch.Tensor) or component_tensor.ndim != 1:
+                 logger.warning(
+                    f"Itemized reward component '{component_name}' (key: {batch_key}) is not a 1D tensor "
+                    f"(ndim: {component_tensor.ndim if isinstance(component_tensor, torch.Tensor) else 'N/A'}, "
+                    f"type: {type(component_tensor)}). Skipping metrics."
+                )
+        else:
+            logger.debug(f"Itemized reward component key '{batch_key}' for '{component_name}' not found in batch.batch. Skipping metrics.")
     # multi-turn conversation
     if "__num_turns__" in batch.non_tensor_batch:
         num_turns = batch.non_tensor_batch["__num_turns__"]

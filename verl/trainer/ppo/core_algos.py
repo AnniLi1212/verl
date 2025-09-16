@@ -102,6 +102,7 @@ class AdvantageEstimator(str, Enum):
     OPO = "opo"
     GRPO_PASSK = "grpo_passk"
     GPG = "gpg"
+    TS_GRPO = "ts_grpo"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -685,6 +686,155 @@ def compute_gpg_outcome_advantage(
     return scores, scores
 
 
+@register_adv_est("ts_grpo")
+def compute_ts_grpo_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    reward_extra_info: Optional[dict] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute separate sequence and token GRPO-style advantages
+    
+    Args:
+        token_level_rewards: (bs, response_length) - used as fallback total reward
+        response_mask: (bs, response_length)
+        index: (bs,) - group indices for GRPO normalization  
+        epsilon: Small value for numerical stability
+        norm_adv_by_std_in_grpo: Whether to normalize by std (should be True)
+        config: Algorithm configuration
+        reward_extra_info: Dict containing 'reward_match' and 'reward_format' lists
+        
+    Returns:
+        advantages: (bs, response_length) - combined advantages for token assignment
+        returns: (bs, response_length) - same as advantages
+    """
+    batch_size = token_level_rewards.shape[0]
+    # print(f"DEBUG: Advantage estimator batch_size = {batch_size}")
+    # print(f"DEBUG: token_level_rewards.shape = {token_level_rewards.shape}")
+    # print(f"DEBUG: index.shape = {index.shape if hasattr(index, 'shape') else len(index)}")
+    # print(f"DEBUG: Unique UIDs in batch: {list(set(index))}, total unique: {len(set(index))}")
+    
+    # Extract separate sequence and token rewards from reward_extra_info
+    # Try both possible key formats: direct keys from custom function or mapped keys from trainer
+    match_key = 'reward_match' if 'reward_match' in reward_extra_info else 'match'
+    format_key = 'reward_format' if 'reward_format' in reward_extra_info else 'format'
+    
+    if reward_extra_info is not None and match_key in reward_extra_info and format_key in reward_extra_info:
+        sequence_reward_data = reward_extra_info[match_key]
+        token_reward_data = reward_extra_info[format_key]
+        
+        # Handle both tensor and list inputs properly
+        if isinstance(sequence_reward_data, torch.Tensor):
+            sequence_rewards = sequence_reward_data.clone().detach().to(dtype=torch.float32, device=token_level_rewards.device)
+        else:
+            sequence_rewards = torch.tensor(sequence_reward_data, dtype=torch.float32, device=token_level_rewards.device)
+            
+        if isinstance(token_reward_data, torch.Tensor):
+            token_rewards = token_reward_data.clone().detach().to(dtype=torch.float32, device=token_level_rewards.device)
+        else:
+            token_rewards = torch.tensor(token_reward_data, dtype=torch.float32, device=token_level_rewards.device)
+            
+        print(f"DEBUG: reward_extra_info keys: {list(reward_extra_info.keys())}")
+        print(f"DEBUG: sequence_rewards (match): {sequence_rewards[:3]} (first 3)")
+        print(f"DEBUG: token_rewards (format+0.1*match): {token_rewards[:3]} (first 3)")
+        print(f"DEBUG: Original format scores: {reward_extra_info[format_key][:3] if hasattr(reward_extra_info[format_key], '__getitem__') else 'N/A'}")
+        print(f"DEBUG: Original match scores: {reward_extra_info[match_key][:3] if hasattr(reward_extra_info[match_key], '__getitem__') else 'N/A'}")
+    else:
+        # Fallback: use total rewards for both components
+        print("WARNING: reward_match/reward_format not found in reward_extra_info, falling back to total rewards")
+        total_scores = token_level_rewards.sum(dim=-1)
+        sequence_rewards = total_scores * 0.6
+        token_rewards = total_scores * 0.4
+    
+    # Apply GRPO-style z-score normalization separately to sequence and token rewards
+    # This gives us separate advantages that can be used independently by the policy loss
+    sequence_advantages = torch.zeros_like(sequence_rewards)
+    token_advantages = torch.zeros_like(token_rewards)
+    
+    sequence_weight_sum = 0.6  # Default fallback
+    token_weight_sum = 0.4  # Default fallback
+    
+    weight_ratio = sequence_weight_sum / token_weight_sum
+    
+    # Sequence advantages normalization
+    id2sequence_score = defaultdict(list)
+    id2sequence_mean = {}
+    id2sequence_std = {}
+    
+    with torch.no_grad():
+        for i in range(batch_size):
+            id2sequence_score[index[i]].append(sequence_rewards[i])
+        for idx in id2sequence_score:
+            if len(id2sequence_score[idx]) == 1:
+                # For single-sample groups, use the single reward as mean to avoid scale drift
+                id2sequence_mean[idx] = sequence_rewards[0]
+                id2sequence_std[idx] = torch.tensor(1.0, device=sequence_rewards.device)
+            elif len(id2sequence_score[idx]) > 1:
+                sequence_scores_tensor = torch.stack(id2sequence_score[idx])
+                id2sequence_mean[idx] = torch.mean(sequence_scores_tensor)
+                # Use unbiased=False for stable std across different group sizes
+                id2sequence_std[idx] = torch.std(sequence_scores_tensor, unbiased=False)
+            else:
+                raise ValueError(f"No sequence scores found for group index: {idx}")
+        for i in range(batch_size):
+            if len(id2sequence_score[index[i]]) == 1:
+                # Set advantage to 0 for single-sample groups to avoid scale drift
+                sequence_advantages[i] = torch.tensor(0.0, device=sequence_rewards.device)
+            elif norm_adv_by_std_in_grpo:
+                sequence_advantages[i] = (sequence_rewards[i] - id2sequence_mean[index[i]]) / (id2sequence_std[index[i]] + epsilon)
+            else:
+                sequence_advantages[i] = sequence_rewards[i] - id2sequence_mean[index[i]]
+    
+    # Token advantages normalization  
+    id2token_score = defaultdict(list)
+    id2token_mean = {}
+    id2token_std = {}
+    
+    with torch.no_grad():
+        for i in range(batch_size):
+            id2token_score[index[i]].append(token_rewards[i])
+        for idx in id2token_score:
+            if len(id2token_score[idx]) == 1:
+                # For single-sample groups, use the single reward as mean to avoid scale drift
+                id2token_mean[idx] = token_rewards[0]
+                id2token_std[idx] = torch.tensor(1.0, device=token_rewards.device)
+            elif len(id2token_score[idx]) > 1:
+                token_scores_tensor = torch.stack(id2token_score[idx])
+                id2token_mean[idx] = torch.mean(token_scores_tensor)
+                # Use unbiased=False for stable std across different group sizes
+                id2token_std[idx] = torch.std(token_scores_tensor, unbiased=False)
+            else:
+                raise ValueError(f"No token scores found for group index: {idx}")
+        for i in range(batch_size):
+            if len(id2token_score[index[i]]) == 1:
+                # Set advantage to 0 for single-sample groups to avoid scale drift
+                token_advantages[i] = torch.tensor(0.0, device=token_rewards.device)
+            elif norm_adv_by_std_in_grpo:
+                token_advantages[i] = (token_rewards[i] - id2token_mean[index[i]]) / (id2token_std[index[i]] + epsilon)
+                # Scale token advantages to preserve relative importance vs sequence using weight ratio
+                token_advantages[i] = token_advantages[i] / weight_ratio
+            else:
+                token_advantages[i] = (token_rewards[i] - id2token_mean[index[i]]) / weight_ratio
+    
+    # For the main advantages parameter, use the sum of normalized advantages
+    # This will be used by the policy loss as a fallback when auxiliary assignment isn't used
+    combined_advantages = sequence_advantages + token_advantages
+    
+    print(f"DEBUG: Combined advantages range: {combined_advantages.min():.4f} to {combined_advantages.max():.4f}")
+    print(f"DEBUG: Sequence advantages range: {sequence_advantages.min():.4f} to {sequence_advantages.max():.4f}")
+    print(f"DEBUG: Token advantages range: {token_advantages.min():.4f} to {token_advantages.max():.4f}")
+    
+    # The policy loss expects token-level advantages for the main advantages parameter
+    # but sequence-level sequence_advantages and token_advantages for auxiliary assignment
+    advantages = combined_advantages.unsqueeze(-1) * response_mask
+    
+    return advantages, advantages, sequence_advantages, token_advantages
+
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     """Compute token-level rewards with KL penalty.
 
@@ -967,6 +1117,370 @@ def compute_policy_loss_gspo(
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
+
+@register_policy_loss("ts_gspo")
+def compute_policy_loss_ts_gspo(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "seq-mean-token-mean",
+    config: Optional[DictConfig | ActorConfig] = None,
+    tokenizer=None,
+    responses=None,
+    sequence_advantages: Optional[torch.Tensor] = None,
+    token_advantages: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute the clipped policy objective for TS_GSPO with separate loss aggregation.
+    
+    Computes separate losses for sequence and token parts, applies different clip ratios,
+    and combines them with alpha weights: L = α_seq * L_seq + α_token * L_token
+    
+    Also supports auxiliary advantage assignment (for TS-GRPO compatibility):
+    A = A_sequence ⊙ M_sequence + α_aux * A_token ⊙ M_token
+
+    Args:
+        old_log_prob (torch.Tensor):
+            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+        log_prob (torch.Tensor):
+            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+        advantages (torch.Tensor):
+            Advantage estimates for each action, shape (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+        loss_agg_mode (str, optional):
+            Must be "seq-mean-tok-mean" for TS-GSPO separate aggregation.
+        config: Actor configuration containing:
+            - loss_alpha_sequence: Weight for sequence part loss
+            - loss_alpha_token: Weight for token part loss  
+            - alpha_aux: Auxiliary advantage scaling factor
+            - clip_ratio_sequence_low/high: Clip ratios for sequence parts
+            - clip_ratio_token_low/high: Clip ratios for token parts
+        tokenizer: Tokenizer for sequence extraction (if available).
+        responses: Raw response token IDs for sequence extraction (if available).
+        sequence_advantages: Separate sequence-level advantages (optional).
+        token_advantages: Separate token-level advantages (optional).
+    """
+    
+    assert config is not None
+    assert isinstance(config, ActorConfig)
+    
+    # Check that we're using the correct loss aggregation mode
+    if loss_agg_mode != "seq-mean-token-mean":
+        print(f"WARNING: TS-GSPO separate aggregation designed for seq-mean-token-mean, got {loss_agg_mode}")
+    
+    # Get clip ratios for sequence and token parts separately
+    clip_ratio_sequence_low = getattr(config, 'clip_ratio_sequence_low', config.clip_ratio_low or config.clip_ratio)
+    clip_ratio_sequence_high = getattr(config, 'clip_ratio_sequence_high', config.clip_ratio_high or config.clip_ratio)
+    clip_ratio_token_low = getattr(config, 'clip_ratio_token_low', config.clip_ratio_low or config.clip_ratio)
+    clip_ratio_token_high = getattr(config, 'clip_ratio_token_high', config.clip_ratio_high or config.clip_ratio)
+    
+    # Get alpha weights for combining sequence and token losses
+    loss_alpha_sequence = getattr(config, 'loss_alpha_sequence', 2.0)
+    loss_alpha_token = getattr(config, 'loss_alpha_token', 1.0)
+    
+    alpha_aux = getattr(config, 'alpha_aux', 1.0)   # Auxiliary advantage scaling factor, default to 1.0
+    print(f"DEBUG: Config alpha_aux = {alpha_aux}, hasattr = {hasattr(config, 'alpha_aux')}")
+    clip_ratio_low = getattr(config, 'clip_ratio_low', config.clip_ratio_low or config.clip_ratio) # fallback 
+    clip_ratio_high = getattr(config, 'clip_ratio_high', config.clip_ratio_high or config.clip_ratio) # fallback
+    
+    negative_approx_kl = log_prob - old_log_prob
+    batch_size, response_length = old_log_prob.shape
+    
+    # Try to extract sequence positions
+    sequence_mask = None
+    if tokenizer is not None and responses is not None:
+        try:
+            sequence_mask = _compute_sequence_mask_for_policy_loss(responses, tokenizer, response_mask)
+        except Exception as e:
+            print(f"WARNING: Failed to compute sequence mask for TS_GSPO, falling back to GSPO: {e}")
+    
+    if sequence_mask is None:
+        # If no sequence detection, fallback to GSPO (treat everything as sequence)
+        sequence_mask = torch.ones_like(response_mask)
+        print("DEBUG: No sequence detection available, falling back to GSPO.")
+    else:
+        sequence_count = (sequence_mask * response_mask).sum().item()
+        total_count = response_mask.sum().item()
+        print(f"DEBUG: Sequence detection successful - {sequence_count}/{total_count} tokens are in sequence parts ({sequence_count/total_count*100:.1f}%)")
+    
+    # Initialize with vanilla PPO ratios for token parts
+    token_ratio = torch.exp(torch.clamp(negative_approx_kl, min=-20.0, max=20.0))
+    
+    # For sequence parts: compute GSPO-style sequence-level importance ratios
+    sequence_ratio = token_ratio.clone()  # Start with token ratios
+    
+    for i in range(batch_size):
+        sequence_tokens_mask = sequence_mask[i] * response_mask[i]  # sequence tokens for this sample
+        
+        if sequence_tokens_mask.sum() > 0:
+            # This sample has sequence content - apply GSPO to sequence tokens
+            sequence_length = sequence_tokens_mask.sum().clamp(min=1)
+            sequence_negative_approx_kl_seq = torch.sum(negative_approx_kl[i] * sequence_tokens_mask) / sequence_length
+            
+            # Apply GSPO-style sequence-level ratio to sequence tokens
+            log_seq_importance_ratio = (
+                log_prob[i] - log_prob[i].detach() + 
+                sequence_negative_approx_kl_seq.detach()
+            )
+            log_seq_importance_ratio = torch.clamp(log_seq_importance_ratio, max=10.0)
+            seq_importance_ratio = torch.exp(log_seq_importance_ratio)
+            
+            # Apply sequence-level ratio only to sequence tokens
+            sequence_ratio[i] = torch.where(
+                sequence_tokens_mask.bool(),
+                seq_importance_ratio,
+                sequence_ratio[i]  # Keep token ratio for non-sequence tokens
+            )
+    
+    # Store original advantages for potential GSPO fallback
+    original_advantages = advantages.clone()
+    
+    # Apply auxiliary advantage assignment if separate advantages are provided
+    # This allows compatibility with TS-GRPO style advantage computation
+    if sequence_advantages is not None and token_advantages is not None:
+        print("DEBUG: Using auxiliary advantage assignment with alpha_aux =", alpha_aux)
+        
+        # Check for nan in input advantages
+        seq_nan_count = torch.isnan(sequence_advantages).sum()
+        token_nan_count = torch.isnan(token_advantages).sum()
+        if seq_nan_count > 0 or token_nan_count > 0:
+            print(f"WARNING: Found nan in advantages - seq: {seq_nan_count}, token: {token_nan_count}")
+        
+        # Create advantage tensor with separate sequence and token components
+        advantage_tensor = torch.zeros_like(advantages)
+        
+        for i in range(batch_size):
+            sequence_tokens_mask = sequence_mask[i] * response_mask[i]
+            token_tokens_mask = (1.0 - sequence_mask[i]) * response_mask[i]
+            
+            # Assign advantages: A = A_sequence ⊙ M_sequence + α_aux * A_token ⊙ M_token
+            advantage_tensor[i] = (
+                sequence_advantages[i] * sequence_tokens_mask +
+                alpha_aux * token_advantages[i] * token_tokens_mask
+            )
+        
+        # Check for nan in combined advantages
+        combined_nan_count = torch.isnan(advantage_tensor).sum()
+        if combined_nan_count > 0:
+            print(f"WARNING: Found {combined_nan_count} nan values in combined advantage tensor")
+        
+        # Use auxiliary advantages for hybrid mode
+        hybrid_advantages = advantage_tensor
+    else:
+        hybrid_advantages = advantages
+
+    # Create masks for sequence and token parts
+    sequence_part_mask = sequence_mask * response_mask  # Only sequence tokens
+    token_part_mask = (1.0 - sequence_mask) * response_mask  # Only non-sequence tokens
+    
+    # Check if this is a GSPO fallback case (all content treated as sequence)
+    is_gspo_fallback = (token_part_mask.sum() == 0).item()  # No token content anywhere
+    
+    if is_gspo_fallback:
+        print("DEBUG: GSPO fallback detected - all content treated as sequence, using pure GSPO")
+        print(f"DEBUG: Fallback reason - token_part_mask.sum() = {token_part_mask.sum().item()}")
+        if not hasattr(compute_policy_loss_ts_gspo, '_mode_counts'):
+            compute_policy_loss_ts_gspo._mode_counts = {'hybrid': 0, 'fallback': 0}
+        compute_policy_loss_ts_gspo._mode_counts['fallback'] += 1
+        # Pure GSPO case: use sequence ratios and original unified advantages
+        # Note: We use original advantages, not the auxiliary assignment designed for hybrid mode
+        pg_losses1 = -original_advantages * sequence_ratio
+        pg_losses2 = -original_advantages * torch.clamp(sequence_ratio, 1 - clip_ratio_sequence_low, 1 + clip_ratio_sequence_high)
+        pg_losses = torch.maximum(pg_losses1, pg_losses2)
+        
+        # Use pure GSPO aggregation (seq-mean-token-mean) with the sequence mask
+        raw_loss = agg_loss(loss_mat=pg_losses, loss_mask=sequence_part_mask, loss_agg_mode="seq-mean-token-mean")
+        
+        # Apply sequence scaling to match hybrid mode scaling for sequence content
+        # This ensures fallback cases aren't unintentionally favored due to lower gradient magnitude
+        pg_loss = loss_alpha_sequence * raw_loss
+        
+        # For debug info
+        sequence_loss = raw_loss
+        token_loss = torch.tensor(0.0, device=old_log_prob.device, requires_grad=True)
+        
+    else:
+        print("DEBUG: TS-GSPO hybrid mode - separate sequence and token processing")
+        if not hasattr(compute_policy_loss_ts_gspo, '_mode_counts'):
+            compute_policy_loss_ts_gspo._mode_counts = {'hybrid': 0, 'fallback': 0}
+        compute_policy_loss_ts_gspo._mode_counts['hybrid'] += 1
+        # Hybrid TS-GSPO case: compute separate losses for sequence and token parts
+    
+        # Sequence part loss (using GSPO ratios and sequence clip ratios)
+        sequence_pg_losses1 = -hybrid_advantages * sequence_ratio
+        sequence_pg_losses2 = -hybrid_advantages * torch.clamp(
+            sequence_ratio, 
+            1 - clip_ratio_sequence_low, 
+            1 + clip_ratio_sequence_high
+        )
+        sequence_pg_losses = torch.maximum(sequence_pg_losses1, sequence_pg_losses2)
+        
+        # Token part loss (using vanilla ratios and token clip ratios)  
+        token_pg_losses1 = -hybrid_advantages * token_ratio
+        token_pg_losses2 = -hybrid_advantages * torch.clamp(
+            token_ratio, 
+            1 - clip_ratio_token_low, 
+            1 + clip_ratio_token_high
+        )
+        token_pg_losses = torch.maximum(token_pg_losses1, token_pg_losses2)
+        
+        # Aggregate losses separately using seq-mean-token-mean for each part
+        if sequence_part_mask.sum() > 0:
+            sequence_loss = agg_loss(
+                loss_mat=sequence_pg_losses, 
+                loss_mask=sequence_part_mask, 
+                loss_agg_mode="seq-mean-token-mean"
+            )
+        else:
+            sequence_loss = torch.tensor(0.0, device=old_log_prob.device, requires_grad=True)
+        
+        if token_part_mask.sum() > 0:
+            token_mask_per_seq = token_part_mask.sum(dim=-1)
+            if (token_mask_per_seq > 0).all():
+                token_loss = agg_loss(
+                    loss_mat=token_pg_losses, 
+                    loss_mask=token_part_mask, 
+                    loss_agg_mode="seq-mean-token-mean"
+                )
+            else:
+                # Use token-mean to avoid nan when some sequences have no token content
+                token_loss = agg_loss(
+                    loss_mat=token_pg_losses, 
+                    loss_mask=token_part_mask, 
+                    loss_agg_mode="token-mean"
+                )
+        else:
+            token_loss = torch.tensor(0.0, device=old_log_prob.device, requires_grad=True)
+        
+        # Combine losses with alpha weights: L = α_seq * L_seq + α_token * L_token
+        pg_loss = loss_alpha_sequence * sequence_loss + loss_alpha_token * token_loss
+        
+        # Debug the effective contribution of each component
+        seq_contribution = (loss_alpha_sequence * sequence_loss).item()
+        token_contribution = (loss_alpha_token * token_loss).item()
+        total_loss = pg_loss.item()
+        seq_ratio = abs(seq_contribution) / (abs(seq_contribution) + abs(token_contribution) + 1e-8)
+        print(f"DEBUG: Loss contributions - seq: {seq_contribution:.6f} ({seq_ratio:.1%}), token: {token_contribution:.6f} ({1-seq_ratio:.1%}), total: {total_loss:.6f}")
+        
+        # Periodically report mode usage statistics
+        total_calls = compute_policy_loss_ts_gspo._mode_counts['hybrid'] + compute_policy_loss_ts_gspo._mode_counts['fallback']
+        if total_calls % 50 == 0:  # Every 50 calls
+            hybrid_pct = compute_policy_loss_ts_gspo._mode_counts['hybrid'] / total_calls * 100
+            fallback_pct = compute_policy_loss_ts_gspo._mode_counts['fallback'] / total_calls * 100
+            print(f"DEBUG: Mode usage after {total_calls} calls - Hybrid: {hybrid_pct:.1f}%, Fallback: {fallback_pct:.1f}%")
+    
+    # Compute overall metrics (for logging)
+    if is_gspo_fallback:
+        # In GSPO fallback, all losses use sequence ratios
+        overall_losses = pg_losses
+        overall_losses1 = pg_losses1
+        overall_losses2 = pg_losses2
+    else:
+        # In hybrid mode, combine sequence and token losses for metrics
+        overall_losses = torch.where(
+            sequence_part_mask.bool(),
+            sequence_pg_losses,
+            token_pg_losses
+        )
+        overall_losses1 = torch.where(
+            sequence_part_mask.bool(),
+            sequence_pg_losses1,
+            token_pg_losses1
+        )
+        overall_losses2 = torch.where(
+            sequence_part_mask.bool(),
+            sequence_pg_losses2,
+            token_pg_losses2
+        )
+    
+    pg_clipfrac = verl_F.masked_mean(torch.gt(overall_losses2, overall_losses1).float(), response_mask)
+    pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    
+    # Log debug information about loss composition
+    if sequence_part_mask.sum() > 0 and token_part_mask.sum() > 0:
+        print(f"DEBUG: TS-GSPO loss composition - sequence: {sequence_loss.item():.6f} (α={loss_alpha_sequence}), "
+              f"token: {token_loss.item():.6f} (α={loss_alpha_token}), "
+              f"combined: {pg_loss.item():.6f}")
+    elif sequence_part_mask.sum() > 0:
+        print(f"DEBUG: TS-GSPO - only sequence content, loss: {sequence_loss.item():.6f}")
+    else:
+        print(f"DEBUG: TS-GSPO - only token content, loss: {token_loss.item():.6f}")
+    
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
+def _compute_sequence_mask_for_policy_loss(responses: torch.Tensor, tokenizer, response_mask: torch.Tensor) -> torch.Tensor:
+    """Helper function to compute sequence mask for policy loss computation.
+    
+    Returns:
+        torch.Tensor: sequence mask of shape (batch_size, response_length) where 1=sequence, 0=non-sequence
+    """
+    import re
+    
+    batch_size, response_length = responses.shape
+    sequence_mask = torch.zeros_like(responses, dtype=torch.float)
+    
+    for i in range(batch_size):
+        try:
+            response_ids = responses[i]
+            # print(f"🦋: Response_ids: {response_ids}")
+            
+            # Find non-zero tokens (ignore padding)
+            valid_mask = response_ids != tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') else response_ids != 0
+            if valid_mask.sum() == 0:
+                continue
+                
+            # Decode response text
+            valid_response_ids = response_ids[valid_mask]
+            response_text = tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            # print(f"🦋: Response_text: {response_text}")
+            
+            # Extract sequence content and positions
+            sequence_pattern = r'<answer>\s*(.*?)<\/answer>'
+            sequence_match = re.search(sequence_pattern, response_text, re.DOTALL | re.IGNORECASE)
+            
+            if sequence_match:
+                # Found sequence block - compute token positions
+                content_start = sequence_match.start(1)
+                content_end = sequence_match.end(1)
+                
+                # Map to token positions (approximate)
+                pre_sequence_text = response_text[:content_start]
+                sequence_content = response_text[content_start:content_end]
+                
+                pre_sequence_tokens = tokenizer.encode(pre_sequence_text, add_special_tokens=False) if pre_sequence_text else []
+                sequence_tokens = tokenizer.encode(sequence_content, add_special_tokens=False) if sequence_content else []
+                
+                valid_positions = torch.where(valid_mask)[0]
+                sequence_start_pos = min(len(pre_sequence_tokens), len(valid_positions) - 1)
+                sequence_end_pos = min(sequence_start_pos + len(sequence_tokens), len(valid_positions))
+                
+                # Mark sequence tokens
+                for token_idx in range(sequence_start_pos, sequence_end_pos):
+                    if token_idx < len(valid_positions):
+                        original_pos = valid_positions[token_idx]
+                        if original_pos < response_length:
+                            sequence_mask[i, original_pos] = 1.0
+            else:
+                # No answer tags found - fallback to GSPO (treat everything as sequence)
+                valid_positions = torch.where(valid_mask)[0]
+                for pos in valid_positions:
+                    if pos < response_length:
+                        sequence_mask[i, pos] = 1.0  # Treat everything as sequence for GSPO fallback
+                        
+        except Exception as e:
+            print(f"WARNING: Error in sequence mask computation for sample {i}: {e}")
+            # On error, fallback to GSPO (treat everything as sequence)
+            valid_mask = responses[i] != tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') else responses[i] != 0
+            valid_positions = torch.where(valid_mask)[0]
+            for pos in valid_positions:
+                if pos < response_length:
+                    sequence_mask[i, pos] = 1.0
+    
+    return sequence_mask
 
 @register_policy_loss("gpg")
 def compute_policy_loss_gpg(

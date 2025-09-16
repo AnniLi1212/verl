@@ -78,6 +78,13 @@ class ActorConfig(BaseConfig):
         kl_loss_type (str): Type of KL loss to use.
         ppo_epochs (int): Number of PPO epochs per training step.
         shuffle (bool): Whether to shuffle data during training.
+        alpha_aux (float): Auxiliary advantage scaling factor for TS-GRPO algorithm.
+        loss_alpha_sequence (float): Scaling factor for sequence parts (α_sequence), starting point 2:1 ratio.
+        loss_alpha_token (float): Scaling factor for token parts (α_token).
+        clip_ratio_sequence_low (float): Tighter clip for sequence parts
+        clip_ratio_sequence_high (float): Tighter clip for sequence parts
+        clip_ratio_token_low (float): Looser clip for token parts
+        clip_ratio_token_high (float): Looser clip for token parts
         checkpoint (CheckpointConfig): Configuration for checkpointing.
         optim (OptimizerConfig): Configuration for optimizer.
         use_fused_kernels (bool): Whether to use custom fused kernels (e.g., FlashAttention, fused MLP).
@@ -112,6 +119,14 @@ class ActorConfig(BaseConfig):
     kl_loss_type: str = "low_var_kl"
     ppo_epochs: int = 1
     shuffle: bool = False
+    alpha_aux: float = 1.0
+    # TS-GSPO specific parameters
+    loss_alpha_sequence: float = 2.0  # Scaling factor for sequence parts (α_sequence)
+    loss_alpha_token: float = 1.0  # Scaling factor for token parts (α_token)
+    clip_ratio_sequence_low: float = 0.28  # Tighter clip for sequence parts (ε_sequence)
+    clip_ratio_token_low: float = 0.2  # Looser clip for token parts (ε_token)
+    clip_ratio_sequence_high: float = 0.25
+    clip_ratio_token_high: float = 0.28
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
     use_fused_kernels: bool = False

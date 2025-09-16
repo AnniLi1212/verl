@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import logging
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -60,6 +61,7 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 
+std_logger = logging.getLogger(f"verl.{__name__}")
 
 @dataclass
 class ResourcePoolManager:
@@ -253,6 +255,26 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.TS_GRPO:
+        # Special handling for TS GRPO with separate reward components
+        grpo_calculation_mask = data.batch["response_mask"]
+        reward_extra_info = data.batch.get("reward_extra_info", None)
+        if reward_extra_info is None:
+            print("WARNING: reward_extra_info not found in batch")
+        
+        advantages, returns, sequence_advantages, token_advantages = core_algos.compute_ts_grpo_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=grpo_calculation_mask,
+            index=data.non_tensor_batch["uid"],
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+            reward_extra_info=reward_extra_info,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
+        # Store separate advantages in batch for policy loss to access
+        data.batch["sequence_advantages"] = sequence_advantages
+        data.batch["token_advantages"] = token_advantages
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -1081,6 +1103,22 @@ class RayPPOTrainer:
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            
+                            # Store reward_extra_info for advantage computation access
+                            batch.batch["reward_extra_info"] = reward_extra_infos_dict
+                            
+                            # Convert reward components to tensors for itemized reward logging
+                            reward_component_mapping = {
+                                "match": "reward_match", 
+                                "format": "reward_format",
+                                "score": "reward_total_score",
+                            }
+                            
+                            for reward_key, batch_key in reward_component_mapping.items():
+                                if reward_key in reward_extra_infos_dict:
+                                    reward_values = reward_extra_infos_dict[reward_key]
+                                    if isinstance(reward_values, list) and len(reward_values) > 0:
+                                        batch.batch[batch_key] = torch.tensor(reward_values, dtype=torch.float32)
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -1106,6 +1144,10 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        
+                        # Clean up reward_extra_info after advantage computation to avoid tensor distribution issues
+                        if "reward_extra_info" in batch.batch:
+                            del batch.batch["reward_extra_info"]
 
                     # update critic
                     if self.use_critic:
@@ -1212,6 +1254,12 @@ class RayPPOTrainer:
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                
+                # Clean up separate advantages after metrics computation
+                if "sequence_advantages" in batch.batch:
+                    del batch.batch["sequence_advantages"]
+                if "token_advantages" in batch.batch:
+                    del batch.batch["token_advantages"]
 
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
