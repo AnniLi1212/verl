@@ -244,9 +244,16 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     # The keys in batch.batch are an assumption (e.g., 'reward_valid_sql').
     # The component_name will be used in the metric key (e.g., 'itemized_rewards/valid_sql/mean').
     itemized_reward_components_to_log = {
-        "match": "reward_match",
-        "format": "reward_format",
-        "total_score": "reward_total_score",
+        "execution": "reward_execution",                    # SQL executes successfully  
+        "match": "reward_match",                           # Results match ground truth
+        "format": "reward_format",                         # Plan format is valid
+        "table_linking": "reward_table_linking",           # Plan tables match GT tables
+        "column_linking": "reward_column_linking",         # Plan columns match GT columns  
+        "table_plan_following": "reward_table_plan_following",  # SQL follows plan tables
+        "column_plan_following": "reward_column_plan_following", # SQL follows plan columns
+        "sql_reward": "reward_sql",
+        "plan_reward": "reward_plan",
+        "total_score": "reward_total_score",               # Overall composite score
     }
 
     for component_name, batch_key in itemized_reward_components_to_log.items():

@@ -721,8 +721,8 @@ def compute_ts_grpo_advantage(
     
     # Extract separate sequence and token rewards from reward_extra_info
     # Try both possible key formats: direct keys from custom function or mapped keys from trainer
-    match_key = 'reward_match' if 'reward_match' in reward_extra_info else 'match'
-    format_key = 'reward_format' if 'reward_format' in reward_extra_info else 'format'
+    match_key = 'reward_sql' if 'reward_sql' in reward_extra_info else 'sql_reward'
+    format_key = 'reward_plan' if 'reward_plan' in reward_extra_info else 'plan_reward'
     
     if reward_extra_info is not None and match_key in reward_extra_info and format_key in reward_extra_info:
         sequence_reward_data = reward_extra_info[match_key]
@@ -739,11 +739,11 @@ def compute_ts_grpo_advantage(
         else:
             token_rewards = torch.tensor(token_reward_data, dtype=torch.float32, device=token_level_rewards.device)
             
-        print(f"DEBUG: reward_extra_info keys: {list(reward_extra_info.keys())}")
-        print(f"DEBUG: sequence_rewards (match): {sequence_rewards[:3]} (first 3)")
-        print(f"DEBUG: token_rewards (format+0.1*match): {token_rewards[:3]} (first 3)")
-        print(f"DEBUG: Original format scores: {reward_extra_info[format_key][:3] if hasattr(reward_extra_info[format_key], '__getitem__') else 'N/A'}")
-        print(f"DEBUG: Original match scores: {reward_extra_info[match_key][:3] if hasattr(reward_extra_info[match_key], '__getitem__') else 'N/A'}")
+        # print(f"DEBUG: reward_extra_info keys: {list(reward_extra_info.keys())}")
+        # print(f"DEBUG: sequence_rewards (match): {sequence_rewards[:3]} (first 3)")
+        # print(f"DEBUG: token_rewards (format+0.1*match): {token_rewards[:3]} (first 3)")
+        # print(f"DEBUG: Original format scores: {reward_extra_info[format_key][:3] if hasattr(reward_extra_info[format_key], '__getitem__') else 'N/A'}")
+        # print(f"DEBUG: Original match scores: {reward_extra_info[match_key][:3] if hasattr(reward_extra_info[match_key], '__getitem__') else 'N/A'}")
     else:
         # Fallback: use total rewards for both components
         print("WARNING: reward_match/reward_format not found in reward_extra_info, falling back to total rewards")
@@ -755,11 +755,6 @@ def compute_ts_grpo_advantage(
     # This gives us separate advantages that can be used independently by the policy loss
     sequence_advantages = torch.zeros_like(sequence_rewards)
     token_advantages = torch.zeros_like(token_rewards)
-    
-    sequence_weight_sum = 0.6  # Default fallback
-    token_weight_sum = 0.4  # Default fallback
-    
-    weight_ratio = sequence_weight_sum / token_weight_sum
     
     # Sequence advantages normalization
     id2sequence_score = defaultdict(list)
@@ -816,18 +811,16 @@ def compute_ts_grpo_advantage(
                 token_advantages[i] = torch.tensor(0.0, device=token_rewards.device)
             elif norm_adv_by_std_in_grpo:
                 token_advantages[i] = (token_rewards[i] - id2token_mean[index[i]]) / (id2token_std[index[i]] + epsilon)
-                # Scale token advantages to preserve relative importance vs sequence using weight ratio
-                token_advantages[i] = token_advantages[i] / weight_ratio
             else:
-                token_advantages[i] = (token_rewards[i] - id2token_mean[index[i]]) / weight_ratio
+                token_advantages[i] = (token_rewards[i] - id2token_mean[index[i]])
     
     # For the main advantages parameter, use the sum of normalized advantages
     # This will be used by the policy loss as a fallback when auxiliary assignment isn't used
     combined_advantages = sequence_advantages + token_advantages
     
-    print(f"DEBUG: Combined advantages range: {combined_advantages.min():.4f} to {combined_advantages.max():.4f}")
-    print(f"DEBUG: Sequence advantages range: {sequence_advantages.min():.4f} to {sequence_advantages.max():.4f}")
-    print(f"DEBUG: Token advantages range: {token_advantages.min():.4f} to {token_advantages.max():.4f}")
+    # print(f"DEBUG: Combined advantages range: {combined_advantages.min():.4f} to {combined_advantages.max():.4f}")
+    # print(f"DEBUG: Sequence advantages range: {sequence_advantages.min():.4f} to {sequence_advantages.max():.4f}")
+    # print(f"DEBUG: Token advantages range: {token_advantages.min():.4f} to {token_advantages.max():.4f}")
     
     # The policy loss expects token-level advantages for the main advantages parameter
     # but sequence-level sequence_advantages and token_advantages for auxiliary assignment
@@ -1181,7 +1174,7 @@ def compute_policy_loss_ts_gspo(
     loss_alpha_token = getattr(config, 'loss_alpha_token', 1.0)
     
     alpha_aux = getattr(config, 'alpha_aux', 1.0)   # Auxiliary advantage scaling factor, default to 1.0
-    print(f"DEBUG: Config alpha_aux = {alpha_aux}, hasattr = {hasattr(config, 'alpha_aux')}")
+    # print(f"DEBUG: Config alpha_aux = {alpha_aux}, hasattr = {hasattr(config, 'alpha_aux')}")
     clip_ratio_low = getattr(config, 'clip_ratio_low', config.clip_ratio_low or config.clip_ratio) # fallback 
     clip_ratio_high = getattr(config, 'clip_ratio_high', config.clip_ratio_high or config.clip_ratio) # fallback
     
@@ -1240,7 +1233,7 @@ def compute_policy_loss_ts_gspo(
     # Apply auxiliary advantage assignment if separate advantages are provided
     # This allows compatibility with TS-GRPO style advantage computation
     if sequence_advantages is not None and token_advantages is not None:
-        print("DEBUG: Using auxiliary advantage assignment with alpha_aux =", alpha_aux)
+        # print("DEBUG: Using auxiliary advantage assignment with alpha_aux =", alpha_aux)
         
         # Check for nan in input advantages
         seq_nan_count = torch.isnan(sequence_advantages).sum()
@@ -1399,15 +1392,15 @@ def compute_policy_loss_ts_gspo(
     pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
     
-    # Log debug information about loss composition
-    if sequence_part_mask.sum() > 0 and token_part_mask.sum() > 0:
-        print(f"DEBUG: TS-GSPO loss composition - sequence: {sequence_loss.item():.6f} (α={loss_alpha_sequence}), "
-              f"token: {token_loss.item():.6f} (α={loss_alpha_token}), "
-              f"combined: {pg_loss.item():.6f}")
-    elif sequence_part_mask.sum() > 0:
-        print(f"DEBUG: TS-GSPO - only sequence content, loss: {sequence_loss.item():.6f}")
-    else:
-        print(f"DEBUG: TS-GSPO - only token content, loss: {token_loss.item():.6f}")
+    # # Log debug information about loss composition
+    # if sequence_part_mask.sum() > 0 and token_part_mask.sum() > 0:
+    #     print(f"DEBUG: TS-GSPO loss composition - sequence: {sequence_loss.item():.6f} (α={loss_alpha_sequence}), "
+    #           f"token: {token_loss.item():.6f} (α={loss_alpha_token}), "
+    #           f"combined: {pg_loss.item():.6f}")
+    # elif sequence_part_mask.sum() > 0:
+    #     print(f"DEBUG: TS-GSPO - only sequence content, loss: {sequence_loss.item():.6f}")
+    # else:
+    #     print(f"DEBUG: TS-GSPO - only token content, loss: {token_loss.item():.6f}")
     
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
@@ -1416,12 +1409,12 @@ def _compute_sequence_mask_for_policy_loss(responses: torch.Tensor, tokenizer, r
     """Helper function to compute sequence mask for policy loss computation.
     
     Returns:
-        torch.Tensor: sequence mask of shape (batch_size, response_length) where 1=sequence, 0=non-sequence
+        torch.Tensor: SQL mask of shape (batch_size, response_length) where 1=SQL, 0=non-SQL
     """
     import re
     
     batch_size, response_length = responses.shape
-    sequence_mask = torch.zeros_like(responses, dtype=torch.float)
+    sql_mask = torch.zeros_like(responses, dtype=torch.float)
     
     for i in range(batch_size):
         try:
@@ -1438,49 +1431,49 @@ def _compute_sequence_mask_for_policy_loss(responses: torch.Tensor, tokenizer, r
             response_text = tokenizer.decode(valid_response_ids, skip_special_tokens=True)
             # print(f"🦋: Response_text: {response_text}")
             
-            # Extract sequence content and positions
-            sequence_pattern = r'<answer>\s*(.*?)<\/answer>'
-            sequence_match = re.search(sequence_pattern, response_text, re.DOTALL | re.IGNORECASE)
+            # Extract SQL content and positions
+            sql_pattern = r'```sql\s*(.*?)```'
+            sql_match = re.search(sql_pattern, response_text, re.DOTALL | re.IGNORECASE)
             
-            if sequence_match:
-                # Found sequence block - compute token positions
-                content_start = sequence_match.start(1)
-                content_end = sequence_match.end(1)
+            if sql_match:
+                # Found SQL block - compute token positions
+                content_start = sql_match.start(1)
+                content_end = sql_match.end(1)
                 
                 # Map to token positions (approximate)
-                pre_sequence_text = response_text[:content_start]
-                sequence_content = response_text[content_start:content_end]
+                pre_sql_text = response_text[:content_start]
+                sql_content = response_text[content_start:content_end]
                 
-                pre_sequence_tokens = tokenizer.encode(pre_sequence_text, add_special_tokens=False) if pre_sequence_text else []
-                sequence_tokens = tokenizer.encode(sequence_content, add_special_tokens=False) if sequence_content else []
+                pre_sql_tokens = tokenizer.encode(pre_sql_text, add_special_tokens=False) if pre_sql_text else []
+                sql_tokens = tokenizer.encode(sql_content, add_special_tokens=False) if sql_content else []
                 
                 valid_positions = torch.where(valid_mask)[0]
-                sequence_start_pos = min(len(pre_sequence_tokens), len(valid_positions) - 1)
-                sequence_end_pos = min(sequence_start_pos + len(sequence_tokens), len(valid_positions))
+                sql_start_pos = min(len(pre_sql_tokens), len(valid_positions) - 1)
+                sql_end_pos = min(sql_start_pos + len(sql_tokens), len(valid_positions))
                 
-                # Mark sequence tokens
-                for token_idx in range(sequence_start_pos, sequence_end_pos):
+                # Mark SQL tokens
+                for token_idx in range(sql_start_pos, sql_end_pos):
                     if token_idx < len(valid_positions):
                         original_pos = valid_positions[token_idx]
                         if original_pos < response_length:
-                            sequence_mask[i, original_pos] = 1.0
+                            sql_mask[i, original_pos] = 1.0
             else:
-                # No answer tags found - fallback to GSPO (treat everything as sequence)
+                # No SQL found - mark all tokens for fallback (GSPO behavior)
                 valid_positions = torch.where(valid_mask)[0]
                 for pos in valid_positions:
                     if pos < response_length:
-                        sequence_mask[i, pos] = 1.0  # Treat everything as sequence for GSPO fallback
+                        sql_mask[i, pos] = 1.0  # Treat as "SQL" to get normal optimization
                         
         except Exception as e:
-            print(f"WARNING: Error in sequence mask computation for sample {i}: {e}")
-            # On error, fallback to GSPO (treat everything as sequence)
+            print(f"WARNING: Error in SQL mask computation for sample {i}: {e}")
+            # On error, mark all valid tokens (fallback to GSPO)
             valid_mask = responses[i] != tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') else responses[i] != 0
             valid_positions = torch.where(valid_mask)[0]
             for pos in valid_positions:
                 if pos < response_length:
-                    sequence_mask[i, pos] = 1.0
+                    sql_mask[i, pos] = 1.0
     
-    return sequence_mask
+    return sql_mask
 
 @register_policy_loss("gpg")
 def compute_policy_loss_gpg(

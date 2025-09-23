@@ -609,7 +609,7 @@ class RayPPOTrainer:
             if "reward_extra_info" in result:
                 for key, lst in result["reward_extra_info"].items():
                     reward_extra_infos_dict[key].extend(lst)
-                    print(f"len reward_extra_infos_dict['{key}']: {len(reward_extra_infos_dict[key])}")
+                    # print(f"len reward_extra_infos_dict['{key}']: {len(reward_extra_infos_dict[key])}")
 
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
@@ -718,16 +718,17 @@ class RayPPOTrainer:
         wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
         if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
             wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
-        if OmegaConf.select(self.config.global_profiler, "steps") is not None:
-            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.global_profiler, "steps")
+        global_profiler = getattr(self.config, 'global_profiler', None)
+        if global_profiler is not None and OmegaConf.select(global_profiler, "steps") is not None:
+            wg_kwargs["profile_steps"] = OmegaConf.select(global_profiler, "steps")
             # Only require nsight worker options when tool is nsys
-            if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
+            if OmegaConf.select(global_profiler, "tool") == "nsys":
                 assert (
-                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                    OmegaConf.select(global_profiler.global_tool_config.nsys, "worker_nsight_options")
                     is not None
                 ), "worker_nsight_options must be set when using nsys with profile_steps"
                 wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
-                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                    OmegaConf.select(global_profiler.global_tool_config.nsys, "worker_nsight_options")
                 )
         wg_kwargs["device_name"] = self.device_name
 
@@ -968,9 +969,10 @@ class RayPPOTrainer:
         self.max_steps_duration = 0
 
         prev_step_profile = False
+        global_profiler = getattr(self.config, 'global_profiler', None)
         curr_step_profile = (
-            self.global_steps in self.config.global_profiler.steps
-            if self.config.global_profiler.steps is not None
+            self.global_steps in global_profiler.steps
+            if global_profiler is not None and global_profiler.steps is not None
             else False
         )
         next_step_profile = False
@@ -983,7 +985,7 @@ class RayPPOTrainer:
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
                         not prev_step_profile and curr_step_profile
-                        if self.config.global_profiler.profile_continuous_steps
+                        if global_profiler is not None and global_profiler.get('profile_continuous_steps', False)
                         else curr_step_profile
                     )
 
@@ -1109,9 +1111,16 @@ class RayPPOTrainer:
                             
                             # Convert reward components to tensors for itemized reward logging
                             reward_component_mapping = {
+                                "execution": "reward_execution",
                                 "match": "reward_match", 
                                 "format": "reward_format",
-                                "score": "reward_total_score",
+                                "table_linking": "reward_table_linking",
+                                "column_linking": "reward_column_linking",
+                                "table_plan_following": "reward_table_plan_following",
+                                "column_plan_following": "reward_column_plan_following",
+                                "sql_reward": "reward_sql",
+                                "plan_reward": "reward_plan",
+                                "score": "reward_total_score",  # Map 'score' to 'reward_total_score'
                             }
                             
                             for reward_key, batch_key in reward_component_mapping.items():
@@ -1226,13 +1235,13 @@ class RayPPOTrainer:
 
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (
-                        self.global_steps + 1 in self.config.global_profiler.steps
-                        if self.config.global_profiler.steps is not None
+                        self.global_steps + 1 in global_profiler.steps
+                        if global_profiler is not None and global_profiler.steps is not None
                         else False
                     )
                     self._stop_profiling(
                         curr_step_profile and not next_step_profile
-                        if self.config.global_profiler.profile_continuous_steps
+                        if global_profiler is not None and global_profiler.get('profile_continuous_steps', False)
                         else curr_step_profile
                     )
                     prev_step_profile = curr_step_profile

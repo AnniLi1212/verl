@@ -70,6 +70,10 @@ class BatchRewardManager(AbstractRewardManager):
             extra_infos=extras,
             **self.reward_kwargs,
         )
+        # print(f"DEBUG: 🏁 BatchRewardManager.verify() got scores type: {type(scores)}")
+        # print(f"DEBUG: 🏁 First few scores: {scores[:2] if len(scores) > 2 else scores}")
+        # if scores and isinstance(scores[0], dict):
+        #     print(f"DEBUG: 🏁 First score is dict with keys: {list(scores[0].keys())}")
 
         return scores
 
@@ -98,12 +102,16 @@ class BatchRewardManager(AbstractRewardManager):
         for i in range(len(data)):
             length = valid_response_lengths[i].item()
             score = scores[i]
+            # print(f"DEBUG: 🏁 Processing item {i}: score type={type(score)}, value={score}")
 
             if isinstance(score, dict):
                 reward = score["score"]
+                # print(f"DEBUG: 🏁 Item {i} is dict with keys: {list(score.keys())}")
                 for key, value in score.items():
                     reward_extra_info[key].append(value)
+                    # print(f"DEBUG: 🏁   Added {key}={value} to reward_extra_info")
             else:
+                print(f"DEBUG: 🏁 Item {i} is not dict, using as raw reward")
                 reward = score
 
             rewards.append(reward)
@@ -121,6 +129,30 @@ class BatchRewardManager(AbstractRewardManager):
                 already_printed[data_source] = already_printed.get(data_source, 0) + 1
 
         data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32, device=prompt_ids.device)
+
+        # print(f"DEBUG: 🏁 Final reward_extra_info keys: {list(reward_extra_info.keys())}")
+        # print(f"DEBUG: 🏁 Final reward_extra_info contents:")
+        # for key, values in reward_extra_info.items():
+        #     print(f"DEBUG: 🏁   {key}: {values[:3] if len(values) > 3 else values} (total: {len(values)})")
+        
+        # Check for batch size consistency
+        if reward_extra_info:
+            batch_size = len(scores)
+            # print(f"DEBUG: 🏁 Expected batch size: {batch_size}")
+            inconsistent_keys = []
+            for key, values in reward_extra_info.items():
+                if len(values) != batch_size:
+                    inconsistent_keys.append(f"{key}({len(values)})")
+            if inconsistent_keys:
+                print(f"ERROR: 🏁 Batch size mismatch for keys: {inconsistent_keys}")
+                print(f"ERROR: 🏁 Full scores list: {scores}")
+                # Pad missing values with 0.0 to maintain consistency
+                for key, values in reward_extra_info.items():
+                    while len(values) < batch_size:
+                        print(f"WARNING: 🏁 Padding missing value for key '{key}' at position {len(values)}")
+                        values.append(0.0)
+            else:
+                print(f"DEBUG: 🏁 All keys have consistent batch size")
 
         if return_dict:
             return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}

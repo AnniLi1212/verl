@@ -17,6 +17,8 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 
 import os
 import socket
+import sys
+import argparse
 
 import hydra
 import ray
@@ -33,13 +35,29 @@ from verl.utils.import_utils import load_extern_type
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
-def main(config):
+def main_hydra(config):
     """Main entry point for PPO training with Hydra configuration management.
 
     Args:
         config_dict: Hydra configuration dictionary containing training parameters.
     """
     run_ppo(config)
+
+
+def main():
+    """Main entry point that can accept either Hydra config or YAML file."""
+    parser = argparse.ArgumentParser(description='VERL PPO Training')
+    parser.add_argument('--config', type=str, help='Path to YAML config file')
+    
+    # Check if we have a --config argument
+    if '--config' in sys.argv:
+        args = parser.parse_args()
+        # Load YAML config directly
+        config = OmegaConf.load(args.config)
+        run_ppo(config)
+    else:
+        # Fall back to Hydra for backward compatibility
+        main_hydra()
 
 
 # Define a function to run the PPO-like training process
@@ -58,7 +76,10 @@ def run_ppo(config) -> None:
         # NCCL debug level, VLLM logging level, and allow runtime LoRA updating
         # `num_cpus` specifies the number of CPU cores Ray can use, obtained from the configuration
         default_runtime_env = get_ppo_ray_runtime_env()
-        ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
+        
+        # Handle missing ray_kwargs gracefully
+        ray_kwargs = getattr(config, 'ray_kwargs', {})
+        ray_init_kwargs = ray_kwargs.get("ray_init", {}) if ray_kwargs else {}
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
@@ -67,17 +88,19 @@ def run_ppo(config) -> None:
 
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
+    global_profiler = getattr(config, 'global_profiler', None)
     if (
         is_cuda_available
-        and config.global_profiler.tool == "nsys"
-        and config.global_profiler.get("steps") is not None
-        and len(config.global_profiler.get("steps", [])) > 0
+        and global_profiler is not None
+        and global_profiler.get("tool") == "nsys"
+        and global_profiler.get("steps") is not None
+        and len(global_profiler.get("steps", [])) > 0
     ):
         from verl.utils.import_utils import is_nvtx_available
 
         assert is_nvtx_available(), "nvtx is not available in CUDA platform. Please 'pip3 install nvtx'"
         nsight_options = OmegaConf.to_container(
-            config.global_profiler.global_tool_config.nsys.controller_nsight_options
+            global_profiler.global_tool_config.nsys.controller_nsight_options
         )
         runner = TaskRunner.options(runtime_env={"nsight": nsight_options}).remote()
     else:
@@ -172,13 +195,14 @@ class TaskRunner:
             global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
         }
         # TODO Here you can use the new registration method to support dynamic registration of roles
-        if config.reward_model.enable_resource_pool:
-            if config.reward_model.n_gpus_per_node <= 0:
+        reward_model = getattr(config, 'reward_model', {})
+        if reward_model.get('enable_resource_pool', False):
+            if reward_model.get('n_gpus_per_node', 0) <= 0:
                 raise ValueError("config.reward_model.n_gpus_per_node must be greater than 0")
-            if config.reward_model.nnodes <= 0:
+            if reward_model.get('nnodes', 0) <= 0:
                 raise ValueError("config.reward_model.nnodes must be greater than 0")
 
-            reward_pool = [config.reward_model.n_gpus_per_node] * config.reward_model.nnodes
+            reward_pool = [reward_model.get('n_gpus_per_node', 0)] * reward_model.get('nnodes', 0)
             resource_pool_spec["reward_pool"] = reward_pool
 
         self.mapping[Role.ActorRollout] = global_pool_id
